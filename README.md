@@ -37,7 +37,7 @@ discard conn.sendText("hello")
 | Want | `ws` |
 |---|---|
 | A WebSocket that speaks the wire protocol correctly | RFC 6455 framing + the `base64(SHA1(key‖GUID))` accept handshake, verified against the RFC test vector and a live public server |
-| The same code for `ws://` and `wss://` | one `WebSocket` over either a `net.Socket` or a `net/tls.TlsSocket` |
+| The same code for `ws://` and `wss://` | one `WebSocket` over either a `net.Socket` or a `tls.TlsSocket` |
 | Both ends | server (`acceptWebSocket` / `newServerWebSocket`) and client (`newClientWebSocket`) roles, with correct masking rules per role |
 | No surprises on control frames | pings answered with pongs automatically, close frames echoed, fragments reassembled — all inside `receive` |
 
@@ -97,7 +97,7 @@ online, a real `wss://` echo server.
 ## Requirements
 
 - Nimony.
-- [`net`](https://github.com/aoughwl/net) (+ its `net/tls`, OpenSSL 3) and
+- [`net`](https://github.com/aoughwl/net) (+ its `tls`, OpenSSL 3) and
   [`http`](https://github.com/aoughwl/http).
 
 ## License

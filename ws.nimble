@@ -7,3 +7,4 @@ srcDir      = "."
 
 requires "net"
 requires "http"
+requires "tls"

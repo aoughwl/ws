@@ -5,7 +5,7 @@
 
 import std/syncio
 import net
-import net/tls
+import tls
 import ws
 import ws/handshake
 

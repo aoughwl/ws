@@ -1,5 +1,5 @@
 ## ws — a nimony-native WebSocket (RFC 6455), server and client, over plaintext
-## (`ws://`, a `net.Socket`) or TLS (`wss://`, a `net/tls.TlsSocket`).
+## (`ws://`, a `net.Socket`) or TLS (`wss://`, a `tls.TlsSocket`).
 ##
 ##   import ws
 ##
@@ -21,7 +21,7 @@
 import std/random
 import std/base64
 import net
-import net/tls
+import tls
 import http/request
 import ws/frame
 import ws/handshake
