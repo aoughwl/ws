@@ -25,6 +25,7 @@ import http/request
 import ws/frame
 import ws/handshake
 import ws/rng
+import ws/deflate
 
 export frame
 
@@ -46,6 +47,7 @@ type
     pongTimeoutMs: int    ## deadline for a pong reply before declaring the peer dead
     nextPingAt: int64     ## monotonic-ms timestamp of the next scheduled ping
     pongDeadline: int64   ## monotonic-ms deadline for an outstanding pong (0 = none)
+    deflate*: bool        ## permessage-deflate negotiated (RFC 7692, no_context_takeover)
 
   WsMessage* = object
     ## A fully-reassembled application message (all fragments joined). `opcode`
@@ -155,12 +157,13 @@ proc toOpcode(v: int; op: var Opcode): bool =
   return true
 
 proc readFrame(ws: var WebSocket; op: var Opcode; payload: var string;
-               fin: var bool): bool =
+               fin: var bool; rsv1: var bool): bool =
   let h = readExactly(ws.tr, 2)
   if h.len < 2: return false
   let b0 = uint8(ord(h[0]))
   let b1 = uint8(ord(h[1]))
   fin = (b0 and 0x80'u8) != 0'u8
+  rsv1 = (b0 and 0x40'u8) != 0'u8
   if not toOpcode(int(b0 and 0x0f'u8), op):
     return false
   let masked = (b1 and 0x80'u8) != 0'u8
@@ -196,10 +199,19 @@ proc readFrame(ws: var WebSocket; op: var Opcode; payload: var string;
 
 proc sendFrame(ws: var WebSocket; op: Opcode; data: string; fin: bool): bool =
   let masked = ws.role == wsClient
+  # permessage-deflate: compress data messages (never control frames) and flag
+  # RSV1. no_context_takeover ⇒ each message is an independent DEFLATE stream.
+  var body = data
+  var rsv1 = false
+  if ws.deflate and (op == opText or op == opBinary):
+    let c = deflateMessage(data)
+    if c.ok:
+      body = c.data
+      rsv1 = true
   var mask = default(array[4, uint8])
   if masked:
     mask = randomMask()
-  let bytes = encodeFrame(op, data, fin, masked, mask)
+  let bytes = encodeFrame(op, body, fin, masked, mask, rsv1)
   twWriteAll(ws.tr, bytes)
 
 # ---------------------------------------------------------------------------
@@ -315,13 +327,15 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
   var assembled = ""
   var firstOp = opText
   var started = false
+  var compressed = false   ## RSV1 of the message's first frame (permessage-deflate)
   while ws.open:
     if not awaitFrame(ws):
       return false
     var op = opText
     var payload = ""
     var fin = false
-    if not readFrame(ws, op, payload, fin):
+    var rsv1 = false
+    if not readFrame(ws, op, payload, fin, rsv1):
       ws.open = false
       return false
     resetKeepalive(ws)
@@ -338,8 +352,15 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
     elif op == opText or op == opBinary:
       firstOp = op
       started = true
+      compressed = rsv1 and ws.deflate
       assembled = payload
       if fin:
+        if compressed:
+          let d = inflateMessage(assembled)
+          if not d.ok:
+            ws.open = false
+            return false
+          assembled = d.data
         msg.opcode = firstOp
         msg.data = assembled
         return true
@@ -349,6 +370,12 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
         return false
       assembled.add payload
       if fin:
+        if compressed:
+          let d = inflateMessage(assembled)
+          if not d.ok:
+            ws.open = false
+            return false
+          assembled = d.data
         msg.opcode = firstOp
         msg.data = assembled
         return true
@@ -358,15 +385,19 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
 # Handshake constructors
 # ---------------------------------------------------------------------------
 
-proc newServerWebSocket*(sock: Socket; req: Request): WebSocket =
+proc newServerWebSocket*(sock: Socket; req: Request; allowDeflate = true): WebSocket =
   ## Complete the server handshake over a plaintext socket: validate the Upgrade
   ## request, send `101 Switching Protocols`, and return an open server-role
-  ## WebSocket. On a non-upgrade request the result has `open == false`.
+  ## WebSocket. On a non-upgrade request the result has `open == false`. When
+  ## `allowDeflate` (default) and the client offered `permessage-deflate`, accept
+  ## it in no_context_takeover mode.
   result = WebSocket(tr: plainTransport(sock), role: wsServer, open: false)
   if not isWebSocketUpgrade(req):
     return result
-  if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req))):
+  let useDeflate = allowDeflate and requestOffersDeflate(req)
+  if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req), useDeflate)):
     result.open = true
+    result.deflate = useDeflate
 
 proc acceptWebSocket*(sock: Socket): WebSocket =
   ## Convenience for a bare server: read the HTTP Upgrade request directly off
@@ -376,35 +407,44 @@ proc acceptWebSocket*(sock: Socket): WebSocket =
   let raw = readHeaderBlock(tr)
   newServerWebSocket(sock, parseRequest(raw))
 
-proc newServerWebSocketTls*(t: TlsSocket; req: Request): WebSocket =
+proc newServerWebSocketTls*(t: TlsSocket; req: Request; allowDeflate = true): WebSocket =
   ## `newServerWebSocket` over TLS (`wss://`).
   result = WebSocket(tr: tlsTransport(t), role: wsServer, open: false)
   if not isWebSocketUpgrade(req):
     return result
-  if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req))):
+  let useDeflate = allowDeflate and requestOffersDeflate(req)
+  if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req), useDeflate)):
     result.open = true
+    result.deflate = useDeflate
 
 proc clientKey(): string =
   ## 16 random bytes, base64-encoded, for `Sec-WebSocket-Key`.
   encode(randomBytes(16))
 
-proc doClientHandshake(ws: var WebSocket; host: string; path: string): bool =
+proc doClientHandshake(ws: var WebSocket; host: string; path: string;
+                       offerDeflate: bool): bool =
   let key = clientKey()
-  if not twWriteAll(ws.tr, clientHandshakeRequest(host, path, key)):
+  if not twWriteAll(ws.tr, clientHandshakeRequest(host, path, key, offerDeflate)):
     return false
   let resp = readHeaderBlock(ws.tr)
-  clientHandshakeValid(resp, key)
+  if not clientHandshakeValid(resp, key):
+    return false
+  ws.deflate = offerDeflate and responseAcceptsDeflate(resp)
+  return true
 
-proc newClientWebSocket*(sock: Socket; host: string; path = "/"): WebSocket =
+proc newClientWebSocket*(sock: Socket; host: string; path = "/";
+                         offerDeflate = false): WebSocket =
   ## Perform the client handshake over an already-connected plaintext socket.
   ## Returns an open client-role WebSocket, or `open == false` if the handshake
-  ## is rejected.
+  ## is rejected. When `offerDeflate`, advertise `permessage-deflate`
+  ## (no_context_takeover); `ws.deflate` reflects whether the server accepted.
   result = WebSocket(tr: plainTransport(sock), role: wsClient, open: false)
-  if doClientHandshake(result, host, path):
+  if doClientHandshake(result, host, path, offerDeflate):
     result.open = true
 
-proc newClientWebSocketTls*(t: TlsSocket; host: string; path = "/"): WebSocket =
+proc newClientWebSocketTls*(t: TlsSocket; host: string; path = "/";
+                            offerDeflate = false): WebSocket =
   ## `newClientWebSocket` over TLS (`wss://`).
   result = WebSocket(tr: tlsTransport(t), role: wsClient, open: false)
-  if doClientHandshake(result, host, path):
+  if doClientHandshake(result, host, path, offerDeflate):
     result.open = true

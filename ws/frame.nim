@@ -19,14 +19,18 @@ proc isControl*(op: Opcode): bool =
   ord(op) >= 0x8
 
 proc encodeFrame*(op: Opcode; payload: string; fin: bool; masked: bool;
-                  maskKey: array[4, uint8]): string =
+                  maskKey: array[4, uint8]; rsv1 = false): string =
   ## Serialize one frame. When `masked`, the payload is XOR-masked with `maskKey`
   ## and the key is written into the header (client role); otherwise the payload
-  ## is written verbatim (server role).
+  ## is written verbatim (server role). `rsv1` sets the RSV1 bit, which
+  ## permessage-deflate (RFC 7692) uses on the first frame of a compressed
+  ## message.
   result = ""
   var b0 = uint8(ord(op)) and 0x0f'u8
   if fin:
     b0 = b0 or 0x80'u8
+  if rsv1:
+    b0 = b0 or 0x40'u8
   result.add char(b0)
 
   let n = payload.len

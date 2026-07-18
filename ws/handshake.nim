@@ -56,17 +56,34 @@ proc websocketKey*(req: Request): string =
   ## The client's `Sec-WebSocket-Key` header value.
   headerValue(req.headers, "Sec-WebSocket-Key")
 
-proc serverHandshakeResponse*(clientKey: string): string =
-  ## The `101 Switching Protocols` response completing the server handshake.
+const deflateOffer = "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+
+proc requestOffersDeflate*(req: Request): bool =
+  ## True when the client offered the `permessage-deflate` extension (RFC 7692).
+  containsToken(headerValue(req.headers, "Sec-WebSocket-Extensions"), "permessage-deflate")
+
+proc responseAcceptsDeflate*(responseHeaders: string): bool =
+  ## True when the server's handshake response accepted `permessage-deflate`.
+  containsToken(responseHeaders, "permessage-deflate")
+
+proc serverHandshakeResponse*(clientKey: string; withDeflate = false): string =
+  ## The `101 Switching Protocols` response completing the server handshake. When
+  ## `withDeflate`, echo a `permessage-deflate` acceptance in no_context_takeover
+  ## mode.
   result = "HTTP/1.1 101 Switching Protocols\r\n"
   result.add "Upgrade: websocket\r\n"
   result.add "Connection: Upgrade\r\n"
   result.add "Sec-WebSocket-Accept: "
   result.add acceptKey(clientKey)
-  result.add "\r\n\r\n"
+  result.add "\r\n"
+  if withDeflate:
+    result.add "Sec-WebSocket-Extensions: " & deflateOffer & "\r\n"
+  result.add "\r\n"
 
-proc clientHandshakeRequest*(host: string; path: string; key: string): string =
-  ## The client's Upgrade request. `key` is a base64-encoded 16-byte nonce.
+proc clientHandshakeRequest*(host: string; path: string; key: string;
+                             offerDeflate = false): string =
+  ## The client's Upgrade request. `key` is a base64-encoded 16-byte nonce. When
+  ## `offerDeflate`, advertise `permessage-deflate` in no_context_takeover mode.
   var p = path
   if p.len == 0:
     p = "/"
@@ -75,6 +92,8 @@ proc clientHandshakeRequest*(host: string; path: string; key: string): string =
   result.add "Upgrade: websocket\r\n"
   result.add "Connection: Upgrade\r\n"
   result.add "Sec-WebSocket-Key: " & key & "\r\n"
+  if offerDeflate:
+    result.add "Sec-WebSocket-Extensions: " & deflateOffer & "\r\n"
   result.add "Sec-WebSocket-Version: 13\r\n\r\n"
 
 proc clientHandshakeValid*(responseHeaders: string; sentKey: string): bool =
