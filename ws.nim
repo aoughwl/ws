@@ -41,6 +41,11 @@ type
     tr: WsTransport
     role*: WsRole
     open*: bool
+    # Keepalive (opt-in; both zero = disabled, fully-blocking receive).
+    pingIntervalMs: int   ## how often to auto-send a ping when idle
+    pongTimeoutMs: int    ## deadline for a pong reply before declaring the peer dead
+    nextPingAt: int64     ## monotonic-ms timestamp of the next scheduled ping
+    pongDeadline: int64   ## monotonic-ms deadline for an outstanding pong (0 = none)
 
   WsMessage* = object
     ## A fully-reassembled application message (all fragments joined). `opcode`
@@ -75,6 +80,32 @@ proc twClose(t: var WsTransport) =
     t.tls.closeTls()
   else:
     t.sock.close()
+
+proc twWaitReadable(t: var WsTransport; ms: int): bool =
+  ## True if the transport has bytes ready within `ms` milliseconds. For TLS,
+  ## already-buffered plaintext (SSL_pending) counts as ready.
+  if t.isTls:
+    if pending(t.tls) > 0: return true
+    return waitReadable(t.tls.socket, ms)
+  return waitReadable(t.sock, ms)
+
+# ---------------------------------------------------------------------------
+# Monotonic clock (for keepalive deadlines)
+# ---------------------------------------------------------------------------
+
+type Timespec = object
+  tvSec: clong
+  tvNsec: clong
+
+proc clockGettime(clkId: cint; tp: ptr Timespec): cint {.cdecl,
+  importc: "clock_gettime", header: "<time.h>".}
+
+const CLOCK_MONOTONIC = cint(1)
+
+proc nowMs(): int64 =
+  var ts = default(Timespec)
+  discard clockGettime(CLOCK_MONOTONIC, addr ts)
+  int64(ts.tvSec) * 1000'i64 + int64(ts.tvNsec) div 1_000_000'i64
 
 proc readExactly(t: var WsTransport; n: int): string =
   ## Read exactly `n` bytes; returns "" if the stream ends first (n > 0).
@@ -210,6 +241,69 @@ proc close*(ws: var WebSocket) =
   twClose(ws.tr)
 
 # ---------------------------------------------------------------------------
+# Keepalive (idle ping / dead-peer timeout)
+# ---------------------------------------------------------------------------
+
+proc setPingInterval*(ws: var WebSocket; intervalMs: int; timeoutMs = 0) =
+  ## Enable keepalive: when the connection has been idle for `intervalMs`,
+  ## `receive` auto-sends a ping; if no frame arrives within `timeoutMs` after
+  ## that ping (default: same as `intervalMs`), the peer is declared dead and the
+  ## connection is closed (`receive` returns false). Opt-in — pass `intervalMs =
+  ## 0` (the default) to disable and keep `receive` fully blocking.
+  ws.pingIntervalMs = intervalMs
+  if timeoutMs > 0:
+    ws.pongTimeoutMs = timeoutMs
+  else:
+    ws.pongTimeoutMs = intervalMs
+  ws.pongDeadline = 0
+  if intervalMs > 0:
+    ws.nextPingAt = nowMs() + int64(intervalMs)
+  else:
+    ws.nextPingAt = 0
+
+proc keepaliveOn(ws: WebSocket): bool =
+  ws.pingIntervalMs > 0
+
+proc resetKeepalive(ws: var WebSocket) =
+  ## Called after any frame is received: the peer is alive, so clear an
+  ## outstanding pong deadline and push the next ping out.
+  if keepaliveOn(ws):
+    ws.pongDeadline = 0
+    ws.nextPingAt = nowMs() + int64(ws.pingIntervalMs)
+
+proc awaitFrame(ws: var WebSocket): bool =
+  ## Block until a frame is readable, driving keepalive. Returns true when the
+  ## transport has data to read; false if the peer missed its pong deadline (dead)
+  ## and the socket was closed. With keepalive off this blocks indefinitely.
+  if not keepaliveOn(ws):
+    return true
+  while ws.open:
+    let now = nowMs()
+    var waitMs = ws.pingIntervalMs
+    let toPing = int(ws.nextPingAt - now)
+    if toPing < waitMs: waitMs = toPing
+    if ws.pongDeadline != 0'i64:
+      let toDead = int(ws.pongDeadline - now)
+      if toDead < waitMs: waitMs = toDead
+    if waitMs < 0: waitMs = 0
+    if twWaitReadable(ws.tr, waitMs):
+      return true
+    let now2 = nowMs()
+    if ws.pongDeadline != 0'i64 and now2 >= ws.pongDeadline:
+      # No pong within the deadline: peer is dead.
+      ws.open = false
+      twClose(ws.tr)
+      return false
+    if ws.pongDeadline == 0'i64 and now2 >= ws.nextPingAt:
+      if not sendFrame(ws, opPing, "", true):
+        ws.open = false
+        twClose(ws.tr)
+        return false
+      ws.pongDeadline = now2 + int64(ws.pongTimeoutMs)
+      ws.nextPingAt = now2 + int64(ws.pingIntervalMs)
+  return false
+
+# ---------------------------------------------------------------------------
 # Public receive API
 # ---------------------------------------------------------------------------
 
@@ -222,12 +316,15 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
   var firstOp = opText
   var started = false
   while ws.open:
+    if not awaitFrame(ws):
+      return false
     var op = opText
     var payload = ""
     var fin = false
     if not readFrame(ws, op, payload, fin):
       ws.open = false
       return false
+    resetKeepalive(ws)
     if op == opPing:
       discard sendFrame(ws, opPong, payload, true)
     elif op == opPong:
