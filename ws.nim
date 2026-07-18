@@ -18,13 +18,13 @@
 ## close handshake are handled by `receive`. Per RFC 6455 a client masks every
 ## frame it sends and a server never masks; both are done for you by role.
 
-import std/random
 import std/base64
 import net
 import tls
 import http/request
 import ws/frame
 import ws/handshake
+import ws/rng
 
 export frame
 
@@ -41,7 +41,6 @@ type
     tr: WsTransport
     role*: WsRole
     open*: bool
-    rng: Rand
 
   WsMessage* = object
     ## A fully-reassembled application message (all fragments joined). `opcode`
@@ -164,19 +163,11 @@ proc readFrame(ws: var WebSocket; op: var Opcode; payload: var string;
       inc i
   return true
 
-proc nextMask(ws: var WebSocket): array[4, uint8] =
-  result = default(array[4, uint8])
-  let r = next(ws.rng)
-  result[0] = uint8(r and 0xff'u64)
-  result[1] = uint8((r shr 8) and 0xff'u64)
-  result[2] = uint8((r shr 16) and 0xff'u64)
-  result[3] = uint8((r shr 24) and 0xff'u64)
-
 proc sendFrame(ws: var WebSocket; op: Opcode; data: string; fin: bool): bool =
   let masked = ws.role == wsClient
   var mask = default(array[4, uint8])
   if masked:
-    mask = nextMask(ws)
+    mask = randomMask()
   let bytes = encodeFrame(op, data, fin, masked, mask)
   twWriteAll(ws.tr, bytes)
 
@@ -270,18 +261,11 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
 # Handshake constructors
 # ---------------------------------------------------------------------------
 
-var gWsSeed = 0x9e3779b9'i64
-
-proc seedRng(fd: int): Rand =
-  gWsSeed = gWsSeed + 0x6d2b79f5'i64
-  initRand(gWsSeed + int64(fd) * 2654435761'i64)
-
 proc newServerWebSocket*(sock: Socket; req: Request): WebSocket =
   ## Complete the server handshake over a plaintext socket: validate the Upgrade
   ## request, send `101 Switching Protocols`, and return an open server-role
   ## WebSocket. On a non-upgrade request the result has `open == false`.
-  result = WebSocket(tr: plainTransport(sock), role: wsServer, open: false,
-                     rng: seedRng(int(sock.handle)))
+  result = WebSocket(tr: plainTransport(sock), role: wsServer, open: false)
   if not isWebSocketUpgrade(req):
     return result
   if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req))):
@@ -297,28 +281,18 @@ proc acceptWebSocket*(sock: Socket): WebSocket =
 
 proc newServerWebSocketTls*(t: TlsSocket; req: Request): WebSocket =
   ## `newServerWebSocket` over TLS (`wss://`).
-  result = WebSocket(tr: tlsTransport(t), role: wsServer, open: false,
-                     rng: seedRng(int(t.socket.handle)))
+  result = WebSocket(tr: tlsTransport(t), role: wsServer, open: false)
   if not isWebSocketUpgrade(req):
     return result
   if twWriteAll(result.tr, serverHandshakeResponse(websocketKey(req))):
     result.open = true
 
-proc clientKey(ws: var WebSocket): string =
+proc clientKey(): string =
   ## 16 random bytes, base64-encoded, for `Sec-WebSocket-Key`.
-  var raw = ""
-  var j = 0
-  while j < 2:
-    let r = next(ws.rng)
-    var shift = 0
-    while shift < 64:
-      raw.add char(uint8((r shr shift) and 0xff'u64))
-      shift = shift + 8
-    inc j
-  encode(raw)
+  encode(randomBytes(16))
 
 proc doClientHandshake(ws: var WebSocket; host: string; path: string): bool =
-  let key = clientKey(ws)
+  let key = clientKey()
   if not twWriteAll(ws.tr, clientHandshakeRequest(host, path, key)):
     return false
   let resp = readHeaderBlock(ws.tr)
@@ -328,14 +302,12 @@ proc newClientWebSocket*(sock: Socket; host: string; path = "/"): WebSocket =
   ## Perform the client handshake over an already-connected plaintext socket.
   ## Returns an open client-role WebSocket, or `open == false` if the handshake
   ## is rejected.
-  result = WebSocket(tr: plainTransport(sock), role: wsClient, open: false,
-                     rng: seedRng(int(sock.handle)))
+  result = WebSocket(tr: plainTransport(sock), role: wsClient, open: false)
   if doClientHandshake(result, host, path):
     result.open = true
 
 proc newClientWebSocketTls*(t: TlsSocket; host: string; path = "/"): WebSocket =
   ## `newClientWebSocket` over TLS (`wss://`).
-  result = WebSocket(tr: tlsTransport(t), role: wsClient, open: false,
-                     rng: seedRng(int(t.socket.handle)))
+  result = WebSocket(tr: tlsTransport(t), role: wsClient, open: false)
   if doClientHandshake(result, host, path):
     result.open = true
