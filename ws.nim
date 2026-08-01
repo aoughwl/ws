@@ -33,6 +33,7 @@ export frame
 const
   DefaultMaxFrame* = 16 * 1024 * 1024    ## largest single frame payload accepted
   DefaultMaxMessage* = 64 * 1024 * 1024  ## largest reassembled message accepted
+  DefaultMaxHandshake* = 16 * 1024       ## largest handshake header block read
 
 type
   WsRole* = enum
@@ -139,8 +140,12 @@ proc readExactly(t: var WsTransport; n: int): string =
       inc i
     got = got + r
 
-proc readHeaderBlock(t: var WsTransport): string =
+proc readHeaderBlock(t: var WsTransport; limit = DefaultMaxHandshake): string =
   ## Read up to and including the CRLFCRLF that ends an HTTP header block.
+  ## Bounded by `limit`: a peer that opens a connection and then streams bytes
+  ## without ever sending CRLFCRLF would otherwise grow this string forever.
+  ## Returns what it has when the limit is hit — the caller's handshake parse
+  ## then fails, which is the correct outcome for a header block that large.
   result = ""
   var one = default(array[1, char])
   while true:
@@ -151,6 +156,8 @@ proc readHeaderBlock(t: var WsTransport): string =
     let n = result.len
     if n >= 4 and result[n-4] == '\r' and result[n-3] == '\n' and
        result[n-2] == '\r' and result[n-1] == '\n':
+      return result
+    if limit > 0 and n >= limit:
       return result
 
 # ---------------------------------------------------------------------------
