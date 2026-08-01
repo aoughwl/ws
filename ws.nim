@@ -26,8 +26,13 @@ import ws/frame
 import ws/handshake
 import ws/rng
 import ws/deflate
+import ws/protocol
 
 export frame
+
+const
+  DefaultMaxFrame* = 16 * 1024 * 1024    ## largest single frame payload accepted
+  DefaultMaxMessage* = 64 * 1024 * 1024  ## largest reassembled message accepted
 
 type
   WsRole* = enum
@@ -48,6 +53,13 @@ type
     nextPingAt: int64     ## monotonic-ms timestamp of the next scheduled ping
     pongDeadline: int64   ## monotonic-ms deadline for an outstanding pong (0 = none)
     deflate*: bool        ## permessage-deflate negotiated (RFC 7692, no_context_takeover)
+    # Size bounds. A frame header carries a 64-bit length chosen by the peer,
+    # and fragments are reassembled into one string — without these a single
+    # remote frame can ask for an unbounded allocation. Exceeding either sends
+    # Close 1009 (message too big) and ends the connection.
+    maxFrame*: int        ## largest single frame payload; 0 = unlimited
+    maxMessage*: int      ## largest reassembled message; 0 = unlimited
+    tooBig*: bool         ## set when a bound was exceeded
 
   WsMessage* = object
     ## A fully-reassembled application message (all fragments joined). `opcode`
@@ -180,6 +192,11 @@ proc readFrame(ws: var WebSocket; op: var Opcode; payload: var string;
     while i < 8:
       length = (length shl 8) or int(uint8(ord(e[i])))
       inc i
+  # The length above came straight off the wire (up to 2^63 in the 127 form).
+  # Refuse it before it reaches readExactly, which would try to allocate it.
+  if length < 0 or (ws.maxFrame > 0 and length > ws.maxFrame):
+    ws.tooBig = true
+    return false
   var mask = default(array[4, uint8])
   if masked:
     let m = readExactly(ws.tr, 4)
@@ -246,6 +263,11 @@ proc sendClose*(ws: var WebSocket; code = 1000; reason = ""): bool =
   let ok = sendFrame(ws, opClose, payload, true)
   ws.open = false
   ok
+
+proc sendCloseTooBig(ws: var WebSocket): bool =
+  ## RFC 6455 §7.4.1 1009: the peer sent a message too large to process. The
+  ## code was defined in `ws/protocol` but nothing ever sent it.
+  sendClose(ws, CloseMessageTooBig, "message too big")
 
 proc close*(ws: var WebSocket) =
   ## Close the underlying transport (after an optional `sendClose`).
@@ -336,6 +358,8 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
     var fin = false
     var rsv1 = false
     if not readFrame(ws, op, payload, fin, rsv1):
+      if ws.tooBig:
+        discard sendCloseTooBig(ws)
       ws.open = false
       return false
     resetKeepalive(ws)
@@ -368,6 +392,13 @@ proc receive*(ws: var WebSocket; msg: var WsMessage): bool =
       if not started:
         ws.open = false
         return false
+      if ws.maxMessage > 0 and assembled.len + payload.len > ws.maxMessage:
+        # a fragmented message can exceed maxMessage even when every single
+        # frame is within maxFrame — bound the reassembly too.
+        ws.tooBig = true
+        discard sendCloseTooBig(ws)
+        ws.open = false
+        return false
       assembled.add payload
       if fin:
         if compressed:
@@ -391,7 +422,9 @@ proc newServerWebSocket*(sock: Socket; req: Request; allowDeflate = true): WebSo
   ## WebSocket. On a non-upgrade request the result has `open == false`. When
   ## `allowDeflate` (default) and the client offered `permessage-deflate`, accept
   ## it in no_context_takeover mode.
-  result = WebSocket(tr: plainTransport(sock), role: wsServer, open: false)
+  result = WebSocket(tr: plainTransport(sock), role: wsServer, open: false,
+                        maxFrame: DefaultMaxFrame,
+                        maxMessage: DefaultMaxMessage)
   if not isWebSocketUpgrade(req):
     return result
   let useDeflate = allowDeflate and requestOffersDeflate(req)
@@ -409,7 +442,9 @@ proc acceptWebSocket*(sock: Socket): WebSocket =
 
 proc newServerWebSocketTls*(t: TlsSocket; req: Request; allowDeflate = true): WebSocket =
   ## `newServerWebSocket` over TLS (`wss://`).
-  result = WebSocket(tr: tlsTransport(t), role: wsServer, open: false)
+  result = WebSocket(tr: tlsTransport(t), role: wsServer, open: false,
+                        maxFrame: DefaultMaxFrame,
+                        maxMessage: DefaultMaxMessage)
   if not isWebSocketUpgrade(req):
     return result
   let useDeflate = allowDeflate and requestOffersDeflate(req)
@@ -438,13 +473,17 @@ proc newClientWebSocket*(sock: Socket; host: string; path = "/";
   ## Returns an open client-role WebSocket, or `open == false` if the handshake
   ## is rejected. When `offerDeflate`, advertise `permessage-deflate`
   ## (no_context_takeover); `ws.deflate` reflects whether the server accepted.
-  result = WebSocket(tr: plainTransport(sock), role: wsClient, open: false)
+  result = WebSocket(tr: plainTransport(sock), role: wsClient, open: false,
+                        maxFrame: DefaultMaxFrame,
+                        maxMessage: DefaultMaxMessage)
   if doClientHandshake(result, host, path, offerDeflate):
     result.open = true
 
 proc newClientWebSocketTls*(t: TlsSocket; host: string; path = "/";
                             offerDeflate = false): WebSocket =
   ## `newClientWebSocket` over TLS (`wss://`).
-  result = WebSocket(tr: tlsTransport(t), role: wsClient, open: false)
+  result = WebSocket(tr: tlsTransport(t), role: wsClient, open: false,
+                        maxFrame: DefaultMaxFrame,
+                        maxMessage: DefaultMaxMessage)
   if doClientHandshake(result, host, path, offerDeflate):
     result.open = true
