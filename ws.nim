@@ -27,13 +27,10 @@ import ws/handshake
 import ws/rng
 import ws/deflate
 import ws/protocol
+import ws/wsconfig
 
 export frame
-
-const
-  DefaultMaxFrame* = 16 * 1024 * 1024    ## largest single frame payload accepted
-  DefaultMaxMessage* = 64 * 1024 * 1024  ## largest reassembled message accepted
-  DefaultMaxHandshake* = 16 * 1024       ## largest handshake header block read
+export wsconfig
 
 type
   WsRole* = enum
@@ -302,6 +299,22 @@ proc setPingInterval*(ws: var WebSocket; intervalMs: int; timeoutMs = 0) =
   else:
     ws.nextPingAt = 0
 
+proc applyConfig*(ws: var WebSocket; cfg: WsConfig) =
+  ## Apply a connection policy. Called by the config-taking constructors before
+  ## the handshake completes, so a bound is in force for the very first frame
+  ## rather than the second — which is where setting `maxFrame` after the fact
+  ## always left it.
+  ##
+  ## `deflate` is not applied here: it is negotiated during the handshake, so
+  ## the constructors consume it directly.
+  if cfg.maxFrame != WsUnset: ws.maxFrame = cfg.maxFrame
+  if cfg.maxMessage != WsUnset: ws.maxMessage = cfg.maxMessage
+  if cfg.pingIntervalMs != WsUnset and cfg.pingIntervalMs > 0:
+    var timeout = 0
+    if cfg.pongTimeoutMs != WsUnset:
+      timeout = cfg.pongTimeoutMs
+    setPingInterval(ws, cfg.pingIntervalMs, timeout)
+
 proc keepaliveOn(ws: WebSocket): bool =
   ws.pingIntervalMs > 0
 
@@ -439,6 +452,14 @@ proc newServerWebSocket*(sock: Socket; req: Request; allowDeflate = true): WebSo
     result.open = true
     result.deflate = useDeflate
 
+proc newServerWebSocket*(sock: Socket; req: Request; cfg: WsConfig): WebSocket =
+  ## Server handshake under an explicit policy. The bounds are in place before
+  ## the first frame is read, which is the difference that matters: setting
+  ## `maxFrame` on the returned socket leaves the handshake and the first read
+  ## governed by the defaults.
+  result = newServerWebSocket(sock, req, wantsDeflate(cfg, true))
+  applyConfig(result, cfg)
+
 proc acceptWebSocket*(sock: Socket): WebSocket =
   ## Convenience for a bare server: read the HTTP Upgrade request directly off
   ## `sock`, parse it, and complete the handshake — no need to wire up request
@@ -446,6 +467,14 @@ proc acceptWebSocket*(sock: Socket): WebSocket =
   var tr = plainTransport(sock)
   let raw = readHeaderBlock(tr)
   newServerWebSocket(sock, parseRequest(raw))
+
+proc acceptWebSocket*(sock: Socket; cfg: WsConfig): WebSocket =
+  ## `acceptWebSocket` under an explicit policy. This is the only entry point
+  ## that can honour `maxHandshake`: the header block is read here, before any
+  ## `WebSocket` exists to carry a bound.
+  var tr = plainTransport(sock)
+  let raw = readHeaderBlock(tr, handshakeCap(cfg))
+  newServerWebSocket(sock, parseRequest(raw), cfg)
 
 proc newServerWebSocketTls*(t: TlsSocket; req: Request; allowDeflate = true): WebSocket =
   ## `newServerWebSocket` over TLS (`wss://`).
@@ -494,3 +523,23 @@ proc newClientWebSocketTls*(t: TlsSocket; host: string; path = "/";
                         maxMessage: DefaultMaxMessage)
   if doClientHandshake(result, host, path, offerDeflate):
     result.open = true
+
+proc newServerWebSocketTls*(t: TlsSocket; req: Request; cfg: WsConfig): WebSocket =
+  ## `newServerWebSocket` over TLS, under an explicit policy.
+  result = newServerWebSocketTls(t, req, wantsDeflate(cfg, true))
+  applyConfig(result, cfg)
+
+proc newClientWebSocket*(sock: Socket; host: string; path: string;
+                         cfg: WsConfig): WebSocket =
+  ## Client handshake under an explicit policy. Note the default for
+  ## `deflate` differs by role — a client does not offer compression unless
+  ## asked — and `wsUnset` preserves that, so passing a config never silently
+  ## changes what an existing call negotiates.
+  result = newClientWebSocket(sock, host, path, wantsDeflate(cfg, false))
+  applyConfig(result, cfg)
+
+proc newClientWebSocketTls*(t: TlsSocket; host: string; path: string;
+                            cfg: WsConfig): WebSocket =
+  ## `newClientWebSocket` over TLS, under an explicit policy.
+  result = newClientWebSocketTls(t, host, path, wantsDeflate(cfg, false))
+  applyConfig(result, cfg)
