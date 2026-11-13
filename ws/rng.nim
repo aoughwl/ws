@@ -52,7 +52,7 @@ proc fillRandomPosix(buf: pointer; n: int): bool =
 when defined(windows):
   # BCryptGenRandom with the system-preferred RNG: no algorithm handle, nothing to open or close.
   # (getrandom(2) and /dev/urandom do not exist here, so this file did not build on Windows.)
-  proc BCryptGenRandom(hAlgorithm: pointer; pbBuffer: pointer; cbBuffer: uint32; dwFlags: uint32): int32
+  proc BCryptGenRandom(hAlgorithm: nil pointer; pbBuffer: pointer; cbBuffer: uint32; dwFlags: uint32): int32
     {.stdcall, importc: "BCryptGenRandom", dynlib: "bcrypt.dll".}
 
   proc fillRandom*(buf: pointer; n: int): bool =
