@@ -72,8 +72,10 @@ proc isValidCloseCode*(code: int): bool =
   ## and application (4000..4999) ranges are valid.
   if code >= 3000 and code <= 4999:
     return true
-  if code >= 1000 and code <= 1011:
-    # 1004 (reserved), 1005 / 1006 (must not appear on the wire) are invalid.
+  if code >= 1000 and code <= 1014:
+    # 1004 (reserved), 1005 / 1006 (must not appear on the wire) are invalid. 1012..1014 (service
+    # restart, try again later, bad gateway) are IANA-registered and real servers send them: a
+    # strict upper bound of 1011 would fail the connection on a perfectly normal close.
     return code != 1004 and code != 1005 and code != 1006
   false
 

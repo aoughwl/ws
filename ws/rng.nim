@@ -37,9 +37,8 @@ proc fillFromUrandom(buf: pointer; n: int): bool =
   discard cClose(fd)
   ok and got >= n
 
-proc fillRandom*(buf: pointer; n: int): bool =
-  ## Fill `n` bytes at `buf` with OS entropy. True on success. Tries
-  ## `getrandom(2)` first, then `/dev/urandom`.
+proc fillRandomPosix(buf: pointer; n: int): bool =
+  ## POSIX: `getrandom(2)` first, then `/dev/urandom`.
   if n <= 0: return true
   var got = 0
   while got < n:
@@ -49,6 +48,21 @@ proc fillRandom*(buf: pointer; n: int): bool =
     got = got + int(r)
   if got >= n: return true
   fillFromUrandom(offsetPtr(buf, got), n - got)
+
+when defined(windows):
+  # BCryptGenRandom with the system-preferred RNG: no algorithm handle, nothing to open or close.
+  # (getrandom(2) and /dev/urandom do not exist here, so this file did not build on Windows.)
+  proc BCryptGenRandom(hAlgorithm: pointer; pbBuffer: pointer; cbBuffer: uint32; dwFlags: uint32): int32
+    {.stdcall, importc: "BCryptGenRandom", dynlib: "bcrypt.dll".}
+
+  proc fillRandom*(buf: pointer; n: int): bool =
+    ## Fill `n` bytes at `buf` with OS entropy. True on success.
+    if n <= 0: return true
+    BCryptGenRandom(nil, buf, uint32(n), 0x00000002'u32) == 0'i32
+else:
+  proc fillRandom*(buf: pointer; n: int): bool =
+    ## Fill `n` bytes at `buf` with OS entropy. True on success.
+    fillRandomPosix(buf, n)
 
 proc randomMask*(): array[4, uint8] =
   ## A fresh 4-byte masking key from the OS CSPRNG (RFC 6455 §5.3).

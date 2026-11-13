@@ -9,6 +9,7 @@ import std/sha1
 import std/base64
 import http/headers
 import http/request
+import http/response
 
 const wsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -81,9 +82,11 @@ proc serverHandshakeResponse*(clientKey: string; withDeflate = false): string =
   result.add "\r\n"
 
 proc clientHandshakeRequest*(host: string; path: string; key: string;
-                             offerDeflate = false): string =
+                             offerDeflate = false; protocols = ""): string =
   ## The client's Upgrade request. `key` is a base64-encoded 16-byte nonce. When
-  ## `offerDeflate`, advertise `permessage-deflate` in no_context_takeover mode.
+  ## `offerDeflate`, advertise `permessage-deflate` in no_context_takeover mode. `protocols`
+  ## is a comma separated subprotocol offer (Sec-WebSocket-Protocol), "" for none; `host` is
+  ## what goes on the Host line, so include ":port" when it is not the scheme's default.
   var p = path
   if p.len == 0:
     p = "/"
@@ -94,10 +97,44 @@ proc clientHandshakeRequest*(host: string; path: string; key: string;
   result.add "Sec-WebSocket-Key: " & key & "\r\n"
   if offerDeflate:
     result.add "Sec-WebSocket-Extensions: " & deflateOffer & "\r\n"
+  if protocols.len > 0:
+    result.add "Sec-WebSocket-Protocol: " & protocols & "\r\n"
   result.add "Sec-WebSocket-Version: 13\r\n\r\n"
 
 proc clientHandshakeValid*(responseHeaders: string; sentKey: string): bool =
-  ## Verify a server's raw handshake response: it must carry the expected
-  ## `Sec-WebSocket-Accept` for the key we sent.
-  containsToken(responseHeaders, "101") and
-    containsToken(responseHeaders, acceptKey(sentKey))
+  ## Verify a server's raw handshake response (RFC 6455 4.2.2): status 101, `Upgrade: websocket`,
+  ## `Connection: Upgrade` and a `Sec-WebSocket-Accept` equal to the one we expect. This used to be
+  ## two substring searches over the whole block ("101" and the accept value anywhere), so a 200
+  ## or 301 that happened to contain both strings passed.
+  let r = parseResponse(responseHeaders)
+  if r.status != 101: return false
+  if not containsToken(headerValue(r.headers, "Upgrade"), "websocket"): return false
+  if not containsToken(headerValue(r.headers, "Connection"), "upgrade"): return false
+  headerValue(r.headers, "Sec-WebSocket-Accept") == acceptKey(sentKey)
+
+proc responseProtocol*(responseHeaders: string): string =
+  ## The subprotocol the server picked (Sec-WebSocket-Protocol), "" when it picked none.
+  headerValue(parseResponse(responseHeaders).headers, "Sec-WebSocket-Protocol")
+
+proc protocolAccepted*(offered: string; chosen: string): bool =
+  ## RFC 6455 4.2.2: the server may only answer with one of the subprotocols the client offered
+  ## (comma separated list, compared exactly after trimming). Nothing chosen is fine.
+  if chosen.len == 0: return true
+  var i = 0
+  while i <= offered.len:
+    var item = ""
+    while i < offered.len and offered[i] != ',':
+      item.add offered[i]
+      inc i
+    var a = 0
+    var b = item.len
+    while a < b and (item[a] == ' ' or item[a] == '\t'): inc a
+    while b > a and (item[b - 1] == ' ' or item[b - 1] == '\t'): dec b
+    var trimmed = ""
+    var k = a
+    while k < b:
+      trimmed.add item[k]
+      inc k
+    if trimmed == chosen: return true
+    inc i
+  return false
