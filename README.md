@@ -1,3 +1,5 @@
+> **Moved.** This library now lives in [aoughwl/std](https://github.com/aoughwl/std/tree/main/ws) (directory `ws/`), with its full history. This repository is kept as a redirect; new work happens in `aoughwl/std`.
+
 # ws
 
 A **nimony-native WebSocket** (RFC 6455) — server and client, over plaintext
